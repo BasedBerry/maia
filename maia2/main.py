@@ -418,6 +418,196 @@ class MAIA2Model(torch.nn.Module):
         return logits_maia, logits_side_info, logits_value
 
 
+class Transformer(nn.Module):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0., elo_dim=64):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.layers = nn.ModuleList([])
+        self.elo_layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.elo_layers.append(nn.ModuleList([
+                EloAwareAttention(dim, heads = heads, dim_head = dim_head, dropout = dropout, elo_dim = elo_dim),
+                FeedForward(dim, mlp_dim, dropout = dropout)
+            ]))
+
+    def forward(self, x, elo_emb):
+        for attn, ff in self.elo_layers:
+            x = attn(x, elo_emb) + x
+            x = ff(x) + x
+
+        return self.norm(x)
+
+class ChessformerFFN(nn.Module):
+    def __init__(self, dim, mlp_dim, dropout=0., beta=1):
+        super().__init__()
+        self.ffn1 = nn.Linear(dim, mlp_dim)
+        self.ffn2 = nn.Linear(mlp_dim, dim)
+        nn.init.xavier_normal_(self.ffn1.weight, gain=beta)
+        nn.init.xavier_normal_(self.ffn2.weight, gain=beta)
+
+        self.net = nn.Sequential(
+            self.ffn1,
+            nn.GELU(),
+            nn.Dropout(dropout),
+            self.ffn2,
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class ChessformerMHA(nn.Module):
+    def __init__(self, dim, heads=8, dim_head=32, dropout=0., beta=1, use_smolgen=False, smolgen_per_square_dim=16, smolgen_intermediate_dim=128, smolgen_gen_size=64, smolgen_weight=None):
+        super().__init__()
+
+        # parameters
+        inner_dim = dim_head * heads
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+        self.beta = beta
+        self.dim_head = dim_head
+        self.smolgen_per_square_dim = smolgen_per_square_dim
+        self.smolgen_intermediate_dim = smolgen_intermediate_dim
+        self.smolgen_gen_size = smolgen_gen_size
+        self.use_smolgen = use_smolgen
+        self.smolgen_weight = smolgen_weight
+
+        # layers
+        self.q = nn.Linear(dim, inner_dim)
+        self.k = nn.Linear(dim, inner_dim)
+        self.v = nn.Linear(dim, inner_dim)
+        self.out = nn.Linear(inner_dim, dim)
+        nn.init.xavier_normal_(self.v.weight, gain=beta)
+        nn.init.xavier_normal_(self.out.weight, gain=beta)
+
+        if self.use_smolgen:
+            self.sm1 = torch.nn.Linear(dim, smolgen_per_square_dim)
+            self.sm2 = torch.nn.Linear(64 * smolgen_per_square_dim, smolgen_intermediate_dim)
+            self.ln1 = torch.nn.LayerNorm(smolgen_intermediate_dim)
+            self.sm3 = torch.nn.Linear(smolgen_intermediate_dim, heads * smolgen_gen_size)
+            self.ln2 = torch.nn.LayerNorm(heads * smolgen_gen_size)
+            self.sm_act = torch.nn.GELU()
+
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x: torch.Tensor):
+        b, n, _ = x.shape
+        assert n == 64, "Input tensor must have shape (batch_size, 64, dim) for chess positions."
+        
+        # compute query, key, value
+        q = self.q(x).view(b, n, self.heads, self.dim_head)
+        k = self.k(x).view(b, n, self.heads, self.dim_head)
+        v = self.v(x).view(b, n, self.heads, self.dim_head)
+
+        att_logits = torch.einsum('bnhd,bmhd->bhnm', q, k) * self.scale
+
+        if self.use_smolgen:
+
+            # compress the board state 
+            smolgen = self.sm1(x)
+            smolgen = smolgen.reshape(-1, 64 * self.smolgen_per_square_dim)
+            smolgen = self.sm2(smolgen)
+            smolgen = self.sm_act(smolgen)
+            smolgen = self.ln1(smolgen)
+
+            # generate the latent attention representations
+            smolgen = self.sm3(smolgen)
+            smolgen = self.sm_act(smolgen)
+            smolgen = self.ln2(smolgen)
+            smolgen = smolgen.reshape(-1, self.heads, self.smolgen_gen_size)
+
+            # apply the smolgen weights as a matmul
+            assert self.smolgen_weight is not None, "Smolgen weights must be provided."
+            smolgen = torch.einsum('bhi,oi->bho', smolgen, self.smolgen_weight)
+            smolgen = smolgen.reshape(-1, self.heads, 64, 64)
+
+            att_logits = att_logits + smolgen
+
+        
+        attn = torch.softmax(att_logits, dim=-1)
+        values = torch.einsum('bhnm,bmhd->bnhd', attn, v)
+        values = values.reshape(b, n, -1)
+        return self.out(values)
+
+
+
+
+class ChessformerLayer(nn.Module):
+
+    def __init__(self, dim, heads=16, dim_head=32, mlp_dim=512, dropout=0., beta=1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.heads = heads
+        self.mha = ChessformerMHA(dim, heads=heads, dim_head=dim_head, dropout=dropout, beta=beta)
+        self.ffn = ChessformerFFN(dim, mlp_dim, dropout=dropout, beta=beta)
+        
+
+    def forward(self, x: torch.Tensor):
+        attn_out = self.mha(x)
+        x = self.norm1(x + attn_out * self.alpha)
+        ffn_hidden = self.ffn(x)
+        x = self.norm2(x + ffn_hidden * self.alpha)
+        return x
+
+class ChessformerModel(torch.nn.Module):
+    
+    def __init__(self, output_dim, elo_dict, cfg):
+        super(ChessformerModel, self).__init__()
+        
+        self.cfg = cfg
+
+        # input
+        self.elo_embedding = torch.nn.Embedding(len(elo_dict), cfg.elo_dim)
+        self.patch_embedding = nn.Sequential(
+            nn.Linear(cfg.input_channels + 2 * cfg.elo_dim, cfg.dim),
+            nn.LayerNorm(cfg.dim),
+        )    
+        self.pos_embedding = nn.Parameter(torch.zeros(64, cfg.dim))
+
+
+        # transformer stack
+        alpha = torch.pow(2 * cfg.num_layers, -0.25)
+        beta = torch.pow(8 * cfg.num_layers, -0.25)
+        layers = []
+        for _ in range(cfg.num_layers):
+            layers.append(ChessformerLayer(cfg.dim, heads=cfg.heads, dim_head=cfg.dim_head, mlp_dim=cfg.mlp_dim, dropout=0.0, alpha=alpha, beta=beta))
+        self.transformer = nn.Sequential(*layers)
+
+
+        # outputs
+        self.last_ln = nn.LayerNorm(cfg.dim)
+        self.fc_1 = nn.Linear(cfg.dim, output_dim)
+        # self.fc_1_1 = nn.Linear(cfg.dim_vit, cfg.dim_vit)
+        self.fc_2 = nn.Linear(cfg.dim, output_dim + 6 + 6 + 1 + 64 + 64)
+        # self.fc_2_1 = nn.Linear(cfg.dim_vit, cfg.dim_vit)
+        self.fc_3 = nn.Linear(128, 1)
+        self.fc_3_1 = nn.Linear(cfg.dim, 128)
+        
+        
+
+
+    def forward(self, boards, elos_self, elos_oppo):
+        
+        # input
+        batch_size = boards.size(0)
+        embs = boards.view(batch_size, self.cfg.input_channels, 64)
+        embs = torch.transpose(embs, 1, 2)  # (batch_size, 64, input_channels)
+        x = self.to_patch_embedding(embs)
+        x += self.pos_embedding
+        
+        #transformer stack
+        x = self.transformer(x).mean(dim=1)
+        
+        # outputs
+        x = self.last_ln(x)
+        logits_maia = self.fc_1(x)
+        logits_side_info = self.fc_2(x)
+        logits_value = self.fc_3(torch.relu(self.fc_3_1(x))).squeeze(dim=-1)
+        
+        return logits_maia, logits_side_info, logits_value
+
+
 def read_monthly_data_path(cfg):
     
     print('Training Data:', flush=True)
