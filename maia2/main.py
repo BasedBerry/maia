@@ -372,7 +372,7 @@ class MAIA2Model(torch.nn.Module):
         self.cfg = cfg
         self.chess_cnn = ChessResNet(BasicBlock, cfg)
         
-        heads = 16
+        heads = 4
         dim_head = 64
         self.to_patch_embedding = nn.Sequential(
             nn.Linear(8 * 8, cfg.dim_vit),
@@ -567,11 +567,11 @@ class ChessformerModel(torch.nn.Module):
 
 
         # transformer stack
-        alpha = torch.pow(2 * cfg.num_layers, -0.25)
-        beta = torch.pow(8 * cfg.num_layers, -0.25)
+        alpha = (2 * cfg.num_layers) ** -0.25
+        beta = (8 * cfg.num_layers) ** -0.25
         layers = []
         for _ in range(cfg.num_layers):
-            layers.append(ChessformerLayer(cfg.dim, heads=cfg.heads, dim_head=cfg.dim_head, mlp_dim=cfg.mlp_dim, dropout=0.0, alpha=alpha, beta=beta))
+            layers.append(ChessformerLayer(cfg.dim, heads=cfg.heads, dim_head=cfg.dim_head, mlp_dim=cfg.mlp_dim, dropout=0.0, beta=beta))
         self.transformer = nn.Sequential(*layers)
 
 
@@ -593,7 +593,10 @@ class ChessformerModel(torch.nn.Module):
         batch_size = boards.size(0)
         embs = boards.view(batch_size, self.cfg.input_channels, 64)
         embs = torch.transpose(embs, 1, 2)  # (batch_size, 64, input_channels)
-        x = self.to_patch_embedding(embs)
+        emb_concat = torch.cat((embs, 
+                                self.elo_embedding(elos_self).unsqueeze(1).expand(-1, 64, -1), 
+                                self.elo_embedding(elos_oppo).unsqueeze(1).expand(-1, 64, -1)), dim=-1)
+        x = self.to_patch_embedding(emb_concat)
         x += self.pos_embedding
         
         #transformer stack

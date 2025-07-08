@@ -5,10 +5,11 @@ import time
 from .utils import seed_everything, readable_time, readable_num, count_parameters
 from .utils import get_all_possible_moves, create_elo_dict
 from .utils import decompress_zst, read_or_create_chunks
-from .main import MAIA2Model, preprocess_thread, train_chunks, read_monthly_data_path
+from .main import MAIA2Model, ChessformerModel, preprocess_thread, train_chunks, read_monthly_data_path
 import torch
 import torch.nn as nn
 import pdb
+from torch.utils.tensorboard import SummaryWriter
 
 
 def run(cfg):
@@ -27,7 +28,9 @@ def run(cfg):
     all_moves_dict = {move: i for i, move in enumerate(all_moves)}
     elo_dict = create_elo_dict()
 
-    model = MAIA2Model(len(all_moves), elo_dict, cfg)
+    # model = MAIA2Model(len(all_moves), elo_dict, cfg)
+    model = ChessformerModel(len(all_moves), elo_dict, cfg)
+
 
     print(model, flush=True)
     model = model.cuda()
@@ -42,6 +45,8 @@ def run(cfg):
 
     accumulated_samples = 0
     accumulated_games = 0
+
+    writer = SummaryWriter(log_dir=save_root)
 
     if cfg.from_checkpoint:
         formatted_month = f"{cfg.checkpoint_month:02d}"
@@ -80,6 +85,7 @@ def run(cfg):
             
             num_chunk = 0
             offset = 0
+            step = 0
             while True:
                 if not queue.empty():
                     if offset + 1 < len(pgn_chunks_sublists):
@@ -96,8 +102,11 @@ def run(cfg):
                     print(f'[# Positions]: {readable_num(accumulated_samples)}', flush=True)
                     print(f'[# Games]: {readable_num(accumulated_games)}', flush=True)
                     print(f'[# Loss]: {loss} | [# Loss MAIA]: {loss_maia} | [# Loss Side Info]: {loss_side_info} | [# Loss Value]: {loss_value}', flush=True)
+                    if step % 100 == 0:
+                        writer.add_scalar('Loss/MAIA', loss_maia, accumulated_samples)
                     if num_chunk == len(pgn_chunks):
                         break
+                    step += 1
 
             num_file += 1
             print(f'### ({num_file} / {len(pgn_paths)}) Took {readable_time(time.time() - start_time)} to train {pgn_path} with {len(pgn_chunks)} chunks.', flush=True)

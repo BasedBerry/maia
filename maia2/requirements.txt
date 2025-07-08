@@ -7,3 +7,4 @@ pyzstd==0.15.9
 Requests==2.32.3
 torch==2.4.0
 tqdm==4.65.0
+pyyaml
