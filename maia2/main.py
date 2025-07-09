@@ -388,7 +388,7 @@ class MAIA2Model(torch.nn.Module):
         self.fc_3 = nn.Linear(128, 1)
         self.fc_3_1 = nn.Linear(cfg.dim_vit, 128)
         
-        self.elo_embedding = torch.nn.Embedding(len(elo_dict), cfg.elo_dim)
+        self.elo_embedding = nn.Embedding(len(elo_dict), cfg.elo_dim)
         
         self.dropout = nn.Dropout(p=0.1)
         self.last_ln = nn.LayerNorm(cfg.dim_vit)
@@ -481,12 +481,12 @@ class ChessformerMHA(nn.Module):
         nn.init.xavier_normal_(self.out.weight, gain=beta)
 
         if self.use_smolgen:
-            self.sm1 = torch.nn.Linear(dim, smolgen_per_square_dim)
-            self.sm2 = torch.nn.Linear(64 * smolgen_per_square_dim, smolgen_intermediate_dim)
-            self.ln1 = torch.nn.LayerNorm(smolgen_intermediate_dim)
-            self.sm3 = torch.nn.Linear(smolgen_intermediate_dim, heads * smolgen_gen_size)
-            self.ln2 = torch.nn.LayerNorm(heads * smolgen_gen_size)
-            self.sm_act = torch.nn.GELU()
+            self.sm1 = nn.Linear(dim, smolgen_per_square_dim)
+            self.sm2 = nn.Linear(64 * smolgen_per_square_dim, smolgen_intermediate_dim)
+            self.ln1 = nn.LayerNorm(smolgen_intermediate_dim)
+            self.sm3 = nn.Linear(smolgen_intermediate_dim, heads * smolgen_gen_size)
+            self.ln2 = nn.LayerNorm(heads * smolgen_gen_size)
+            self.sm_act = nn.GELU()
 
         self.dropout = nn.Dropout(dropout)
     
@@ -505,7 +505,7 @@ class ChessformerMHA(nn.Module):
 
             # compress the board state 
             smolgen = self.sm1(x)
-            smolgen = smolgen.reshape(-1, 64 * self.smolgen_per_square_dim)
+            smolgen = smolgen.reshape(b, 64 * self.smolgen_per_square_dim)
             smolgen = self.sm2(smolgen)
             smolgen = self.sm_act(smolgen)
             smolgen = self.ln1(smolgen)
@@ -534,11 +534,12 @@ class ChessformerMHA(nn.Module):
 
 class ChessformerLayer(nn.Module):
 
-    def __init__(self, dim, heads=16, dim_head=32, mlp_dim=512, dropout=0., beta=1):
+    def __init__(self, dim, heads=16, dim_head=32, mlp_dim=512, dropout=0., alpha=1, beta=1):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.heads = heads
+        self.alpha = alpha
         self.mha = ChessformerMHA(dim, heads=heads, dim_head=dim_head, dropout=dropout, beta=beta)
         self.ffn = ChessformerFFN(dim, mlp_dim, dropout=dropout, beta=beta)
         
@@ -550,7 +551,7 @@ class ChessformerLayer(nn.Module):
         x = self.norm2(x + ffn_hidden * self.alpha)
         return x
 
-class ChessformerModel(torch.nn.Module):
+class ChessformerModel(nn.Module):
     
     def __init__(self, output_dim, elo_dict, cfg):
         super(ChessformerModel, self).__init__()
@@ -558,12 +559,12 @@ class ChessformerModel(torch.nn.Module):
         self.cfg = cfg
 
         # input
-        self.elo_embedding = torch.nn.Embedding(len(elo_dict), cfg.elo_dim)
+        self.elo_embedding = nn.Embedding(len(elo_dict), cfg.elo_dim)
         self.patch_embedding = nn.Sequential(
             nn.Linear(cfg.input_channels + 2 * cfg.elo_dim, cfg.dim),
             nn.LayerNorm(cfg.dim),
         )    
-        self.pos_embedding = nn.Parameter(torch.zeros(64, cfg.dim))
+        self.pos_embedding = nn.Parameter(torch.zeros(1, 64, cfg.dim))
 
 
         # transformer stack
@@ -571,7 +572,7 @@ class ChessformerModel(torch.nn.Module):
         beta = (8 * cfg.num_layers) ** -0.25
         layers = []
         for _ in range(cfg.num_layers):
-            layers.append(ChessformerLayer(cfg.dim, heads=cfg.heads, dim_head=cfg.dim_head, mlp_dim=cfg.mlp_dim, dropout=0.0, beta=beta))
+            layers.append(ChessformerLayer(cfg.dim, heads=cfg.heads, dim_head=cfg.dim_head, mlp_dim=cfg.mlp_dim, dropout=0.0, alpha=alpha, beta=beta))
         self.transformer = nn.Sequential(*layers)
 
 
@@ -596,7 +597,7 @@ class ChessformerModel(torch.nn.Module):
         emb_concat = torch.cat((embs, 
                                 self.elo_embedding(elos_self).unsqueeze(1).expand(-1, 64, -1), 
                                 self.elo_embedding(elos_oppo).unsqueeze(1).expand(-1, 64, -1)), dim=-1)
-        x = self.to_patch_embedding(emb_concat)
+        x = self.patch_embedding(emb_concat)
         x += self.pos_embedding
         
         #transformer stack

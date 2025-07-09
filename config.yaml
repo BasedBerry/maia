@@ -1,5 +1,5 @@
 # General Settings
-data_root: "/home/privateclient/maia/maia2/data/dummy"
+data_root: "/home/privateclient/maia/maia2/data"
 seed: 42
 num_workers: 16
 verbose: 1
@@ -7,10 +7,10 @@ max_epochs: 3
 max_ply: 300
 clock_threshold: 30
 chunk_size: 20000
-start_year: 2016
-start_month: 3
-end_year: 2016
-end_month: 3
+start_year: 2025
+start_month: 6
+end_year: 2025
+end_month: 6
 from_checkpoint: false
 checkpoint_epoch: 0
 checkpoint_year: 2018
