@@ -46,7 +46,7 @@ def run(cfg):
     accumulated_samples = 0
     accumulated_games = 0
 
-    writer = SummaryWriter(log_dir=save_root)
+    writer = SummaryWriter(log_dir="./runs/")
 
     if cfg.from_checkpoint:
         formatted_month = f"{cfg.checkpoint_month:02d}"
@@ -103,7 +103,7 @@ def run(cfg):
                     print(f'[# Games]: {readable_num(accumulated_games)}', flush=True)
                     print(f'[# Loss]: {loss} | [# Loss MAIA]: {loss_maia} | [# Loss Side Info]: {loss_side_info} | [# Loss Value]: {loss_value}', flush=True)
                     if step % 100 == 0:
-                        writer.add_scalar('Loss/MAIA', loss_maia, accumulated_samples)
+                        writer.add_scalar('Loss/MAIA', loss_maia, step)
                     if num_chunk == len(pgn_chunks):
                         break
                     step += 1
