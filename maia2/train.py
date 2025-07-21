@@ -5,7 +5,7 @@ import time
 from .utils import seed_everything, readable_time, readable_num, count_parameters
 from .utils import get_all_possible_moves, create_elo_dict
 from .utils import decompress_zst, read_or_create_chunks
-from .main import MAIA2Model, ChessformerModel, preprocess_thread, train_chunks, read_monthly_data_path
+from .main import MAIA2Model, ChessformerModel, preprocess_thread, train_and_validate_chunks, read_monthly_data_path
 import torch
 import torch.nn as nn
 import pdb
@@ -94,7 +94,11 @@ def run(cfg):
                         worker.start()
                         offset += 1
                     data, game_count, chunk_count = queue.get()
-                    loss, loss_maia, loss_side_info, loss_value = train_chunks(cfg, data, model, optimizer, all_moves_dict, criterion_maia, criterion_side_info, criterion_value)
+                    (
+                    loss, loss_maia, loss_side_info, loss_value,
+                    val_acc_maia, val_loss_maia, val_loss_side_info, val_loss_value
+                    ) = train_and_validate_chunks(cfg, data, model, optimizer, all_moves_dict, criterion_maia, criterion_side_info, criterion_value)
+                    
                     num_chunk += chunk_count
                     accumulated_samples += len(data)
                     accumulated_games += game_count
@@ -102,6 +106,7 @@ def run(cfg):
                     print(f'[# Positions]: {readable_num(accumulated_samples)}', flush=True)
                     print(f'[# Games]: {readable_num(accumulated_games)}', flush=True)
                     print(f'[# Loss]: {loss} | [# Loss MAIA]: {loss_maia} | [# Loss Side Info]: {loss_side_info} | [# Loss Value]: {loss_value}', flush=True)
+                    print(f'[Val Acc MAIA]: {val_acc_maia} | [Val Loss MAIA]: {val_loss_maia} | [Val Loss Side Info]: {val_loss_side_info} | [Val Loss Value]: {val_loss_value}', flush=True)
                     if step % 100 == 0:
                         writer.add_scalar('Loss/MAIA', loss_maia, step)
                     if num_chunk == len(pgn_chunks):
