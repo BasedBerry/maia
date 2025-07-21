@@ -534,13 +534,26 @@ class ChessformerMHA(nn.Module):
 
 class ChessformerLayer(nn.Module):
 
-    def __init__(self, dim, heads=16, dim_head=32, mlp_dim=512, dropout=0., alpha=1, beta=1):
+    def __init__(self, dim, heads=16, dim_head=32, mlp_dim=512, dropout=0.,
+                 alpha=1, beta=1,
+                 use_smolgen=False,
+                 smolgen_weight=None,
+                 smolgen_gen_size=64,
+                 smolgen_per_square_dim=16,
+                 smolgen_intermediate_dim=128):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.heads = heads
         self.alpha = alpha
-        self.mha = ChessformerMHA(dim, heads=heads, dim_head=dim_head, dropout=dropout, beta=beta)
+        self.mha = ChessformerMHA(
+            dim, heads=heads, dim_head=dim_head, dropout=dropout, beta=beta,
+            use_smolgen=use_smolgen,
+            smolgen_weight=smolgen_weight,
+            smolgen_gen_size=smolgen_gen_size,
+            smolgen_per_square_dim=smolgen_per_square_dim,
+            smolgen_intermediate_dim=smolgen_intermediate_dim
+        )        
         self.ffn = ChessformerFFN(dim, mlp_dim, dropout=dropout, beta=beta)
         
 
@@ -566,13 +579,28 @@ class ChessformerModel(nn.Module):
         )    
         self.pos_embedding = nn.Parameter(torch.zeros(1, 64, cfg.dim))
 
+        self.smolgen_weight = nn.Parameter(torch.empty(cfg.smolgen_gen_size, 64 * 64))
+        nn.init.xavier_normal_(self.smolgen_weight)
 
         # transformer stack
         alpha = (2 * cfg.num_layers) ** -0.25
         beta = (8 * cfg.num_layers) ** -0.25
         layers = []
         for _ in range(cfg.num_layers):
-            layers.append(ChessformerLayer(cfg.dim, heads=cfg.heads, dim_head=cfg.dim_head, mlp_dim=cfg.mlp_dim, dropout=0.0, alpha=alpha, beta=beta))
+            layers.append(ChessformerLayer(
+                dim=cfg.dim,
+                heads=cfg.heads,
+                dim_head=cfg.dim_head,
+                mlp_dim=cfg.mlp_dim,
+                dropout=0.0,
+                alpha=alpha,
+                beta=beta,
+                use_smolgen=cfg.use_smolgen,
+                smolgen_weight=self.smolgen_weight, 
+                smolgen_gen_size=cfg.smolgen_gen_size,
+                smolgen_per_square_dim=cfg.smolgen_per_square_dim,
+                smolgen_intermediate_dim=cfg.smolgen_intermediate_dim
+            ))
         self.transformer = nn.Sequential(*layers)
 
 
@@ -684,9 +712,14 @@ def evaluate_MAIA1_data(model, all_moves_dict, elo_dict, cfg, tiny=False):
             break
 
 
-def train_chunks(cfg, data, model, optimizer, all_moves_dict, criterion_maia, criterion_side_info, criterion_value):
-    
-    dataset_train = MAIA2Dataset(data, all_moves_dict, cfg)
+def train_and_validate_chunks(cfg, data, model, optimizer, all_moves_dict, criterion_maia, criterion_side_info, criterion_value):
+    # Split into 80% train, 20% val
+    split_idx = int(len(data) * cfg.train_ratio)
+    train_data = data[:split_idx]
+    val_data = data[split_idx:]
+
+    # TRAINING
+    dataset_train = MAIA2Dataset(train_data, all_moves_dict, cfg)
     dataloader_train = torch.utils.data.DataLoader(dataset_train, 
                                                     batch_size=cfg.batch_size, 
                                                     shuffle=True, 
@@ -694,14 +727,13 @@ def train_chunks(cfg, data, model, optimizer, all_moves_dict, criterion_maia, cr
                                                     num_workers=cfg.num_workers)
     if cfg.verbose:
         dataloader_train = tqdm.tqdm(dataloader_train)
-    
+
     avg_loss = 0
     avg_loss_maia = 0
     avg_loss_side_info = 0
     avg_loss_value = 0
     step = 0
     for boards, labels, elos_self, elos_oppo, legal_moves, side_info, wdl in dataloader_train:
-
         model.train()
         boards = boards.cuda()
         labels = labels.cuda()
@@ -709,18 +741,17 @@ def train_chunks(cfg, data, model, optimizer, all_moves_dict, criterion_maia, cr
         elos_oppo = elos_oppo.cuda()
         side_info = side_info.cuda()
         wdl = wdl.float().cuda()
-        
+
         logits_maia, logits_side_info, logits_value = model(boards, elos_self, elos_oppo)
-        
+
         loss = 0
         loss_maia = criterion_maia(logits_maia, labels)
         loss += loss_maia
-        
+
         if cfg.side_info:
-        
             loss_side_info = criterion_side_info(logits_side_info, side_info) * cfg.side_info_coefficient
             loss += loss_side_info
-        
+
         if cfg.value:
             loss_value = criterion_value(logits_value, wdl) * cfg.value_coefficient
             loss += loss_value
@@ -728,7 +759,7 @@ def train_chunks(cfg, data, model, optimizer, all_moves_dict, criterion_maia, cr
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        
+
         avg_loss += loss.item()
         avg_loss_maia += loss_maia.item()
         if cfg.side_info:
@@ -736,8 +767,65 @@ def train_chunks(cfg, data, model, optimizer, all_moves_dict, criterion_maia, cr
         if cfg.value:
             avg_loss_value += loss_value.item()
         step += 1
-    
-    return round(avg_loss / step, 3), round(avg_loss_maia / step, 3), round(avg_loss_side_info / step, 3), round(avg_loss_value / step, 3)
+
+    # VALIDATION
+    dataset_val = MAIA2Dataset(val_data, all_moves_dict, cfg)
+    dataloader_val = torch.utils.data.DataLoader(dataset_val,
+                                                 batch_size=cfg.batch_size,
+                                                 shuffle=False,
+                                                 drop_last=False,
+                                                 num_workers=cfg.num_workers)
+
+    model.eval()
+    val_loss_maia = 0
+    val_loss_side_info = 0
+    val_loss_value = 0
+    val_correct = 0
+    val_total = 0
+
+    with torch.no_grad():
+        for boards, labels, elos_self, elos_oppo, legal_moves, side_info, wdl in dataloader_val:
+            boards = boards.cuda()
+            labels = labels.cuda()
+            elos_self = elos_self.cuda()
+            elos_oppo = elos_oppo.cuda()
+            legal_moves = legal_moves.cuda()
+            side_info = side_info.cuda()
+            wdl = wdl.float().cuda()
+
+            logits_maia, logits_side_info, logits_value = model(boards, elos_self, elos_oppo)
+
+            # MAIA
+            val_loss_maia += criterion_maia(logits_maia, labels).item()
+            logits_maia_legal = logits_maia * legal_moves
+            preds = logits_maia_legal.argmax(dim=-1)
+            val_correct += (preds == labels).sum().item()
+            val_total += labels.size(0)
+
+            # SIDE INFO
+            if cfg.side_info:
+                val_loss_side_info += criterion_side_info(logits_side_info, side_info).item()
+
+            # VALUE
+            if cfg.value:
+                val_loss_value += criterion_value(logits_value, wdl).item()
+
+    num_batches = len(dataloader_val)
+    val_loss_maia /= num_batches
+    val_loss_side_info = val_loss_side_info / num_batches if cfg.side_info else 0.0
+    val_loss_value = val_loss_value / num_batches if cfg.value else 0.0
+    val_acc_maia = val_correct / val_total if val_total > 0 else 0.0
+
+    return (
+        round(avg_loss / step, 3),
+        round(avg_loss_maia / step, 3),
+        round(avg_loss_side_info / step, 3),
+        round(avg_loss_value / step, 3),
+        round(val_acc_maia, 4),
+        round(val_loss_maia, 4),
+        round(val_loss_side_info, 4),
+        round(val_loss_value, 4),
+    )
 
 
 def preprocess_thread(queue, cfg, pgn_path, pgn_chunks_sublist, elo_dict):
